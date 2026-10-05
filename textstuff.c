@@ -41,7 +41,7 @@ FontDef *
 LoadFont(filename)
 char *filename;
 {
-int32	err_len;
+intptr_t err_len;
 char	*buffer;
 
  kprintf("Attempting to load font\n");

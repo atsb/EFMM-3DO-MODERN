@@ -19,15 +19,15 @@
 *
 \***************************************************************/
 
-typedef	struct FontStruct 
+typedef	struct FontStruct
 {
-		char	*TextPtr;
-		void	*FontPtr;
-		int32	CoordX;
-		int32	CoordY;
-		int32	LineFeedOffset;
-		Item	BItem;
-		void	*PLUTPtr;
+	char* TextPtr;
+	void* FontPtr;
+	int32	CoordX;
+	int32	CoordY;
+	int32	LineFeedOffset;
+	Item	BItem;
+	void* PLUTPtr;
 } FontStruct;
 
 /*
@@ -39,7 +39,7 @@ typedef	struct FontStruct
 *		Maximum number of characters per line
 */
 
-void FontInit (int32 num);
+void FontInit(int32 num);
 
 /*
 *	Name:
@@ -55,7 +55,8 @@ void FontInit (int32 num);
 *		FontStruct pointer
 */
 
-void FontPrint (FontStruct*);
+void FontPrint(FontStruct*);
+int32 FontStringWidth(void* fontPtr, const char* str);
 
 /*
 *	Name:
@@ -64,6 +65,6 @@ void FontPrint (FontStruct*);
 *		Frees memory allocation for characters
 */
 
-void FontFree (void);
+void FontFree(void);
 
 

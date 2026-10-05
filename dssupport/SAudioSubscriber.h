@@ -5,7 +5,7 @@
  *
  *	Written by:		Darren Gibbs
  *
- *	Copyright Â© 1993 The 3DO Company. All Rights Reserved.
+ *	Copyright © 1993 The 3DO Company. All Rights Reserved.
  *
  *	History:
  *

@@ -40,7 +40,7 @@ extern	uint32		ccbextra;
 extern	char	*wallimagefile;
 
 
-static char	saveInfoFileName[] = "/nvram/MonsterManorData";	// NVRAM file name
+static char	saveInfoFileName[] = "MonsterManorData";	// host save file name
 
 static char highScoreScrStr[] = "$progdir/Hi Score.Uncoded16";
 static char loadGameScrStr[]  = "$progdir/load game.Uncoded16";
@@ -93,19 +93,6 @@ Err ClearSaveStuff( int32 clearScores, int32 clearSaves );	// clear high scores 
 
 static Err LoadSaveInfo( struct SaveInfoRec *theInfo );
 static Err WriteSaveInfo( struct SaveInfoRec *theInfo, char *savmsg );
-static Err CreateOpenSaveInfoFile( char *fileName, Item *fileItem );
-static Err WriteDiskFile( Item fileItem, ubyte *data, int32 numberOfBytes );
-static Err ReadDiskFile( Item fileItem, ubyte *data, int32 numberOfBytes );
-static Err GetFileBlockSize( Item fileItem, uint32* blockSize );
-
-// You might want to comment out CHECKRESULT
-
-#define CHECKRESULT( name, val ) \
-	if ( ((int32) val) < 0) \
-	{ \
-		printf("Error: Failure in %s: $%lx\n", name, (int32) val); \
-		PrintfSysErr(val); \
-	}
 
 // Strings I use for instructions (more appear in their local routines; these are
 // Used in more than one place so appear here.
@@ -269,7 +256,8 @@ DoHighScoreScr( int32 newScore )
 	char		achar = 'A';
 	char		zchar = 'Z';
 
-	static char noEditInstrStr[] = " Press A, B, or C when done.";
+	static char noEditInstrStr[] = " Press A, B, or C when";
+	static char noEditDoneInstrStr[] = "Done.";
 	static char editInstr3Str[] = "     Press A when done.";
 
 	// Load Scores From NVRAM
@@ -382,6 +370,11 @@ DoHighScoreScr( int32 newScore )
 			{
 			lineOfText.CoordY += instrLineHeight;
 			lineOfText.TextPtr = noEditInstrStr;
+			FontPrint(&lineOfText);
+			lineOfText.CoordY += instrLineHeight;
+			lineOfText.CoordX = (wide - FontStringWidth(lineOfText.FontPtr,
+				noEditDoneInstrStr)) >> 1;
+			lineOfText.TextPtr = noEditDoneInstrStr;
 			FontPrint(&lineOfText);
 			}
 		else
@@ -562,7 +555,7 @@ DoLoadGameScr( struct SaveGameRec *theGame )
 	static char loadInstr1Str[] = "Use Up-Down to select game.";
 	static char loadInstr2Str[] = "     Press A to load game.";
 	static char loadInstr3Str[] = "       Press C to cancel.";
-	static char loadInstr4Str[] = "   Sorry, no games to load.";
+	static char loadInstr4Str[] = " Sorry, no games to load.";
 
 	// Load Saved Games From Disk
 
@@ -1071,245 +1064,57 @@ ClearSaveStuff( int32 clearScores, int32 clearSaves )
 	return err;
 }
 
-// File Reading/Writing Stuff \\
-
+// File Reading/Writing Stuff
 /*
-**	LoadSaveInfo()
-**
-**	Load the save info from NVRAM if it exists. Otherwise create it & write it.
+** The 3DO version stored this data in /nvram using File Folio IOReqs.
+** The gameplay-facing save format is retained, but the SDL3 build uses a
+** normal host file next to the executable.  This keeps save/high-score logic
+** out of the SDL video/input/audio layer.
 */
 static Err
-LoadSaveInfo( struct SaveInfoRec *theInfo )
+LoadSaveInfo (struct SaveInfoRec *theInfo)
 {
-	Item 	fileItem;
-	Err		err = 0;
+    FILE *f;
+    size_t n;
 
-	fileItem = OpenDiskFile( saveInfoFileName );
-	if ( fileItem < 0 )
-		{
-		err = CreateOpenSaveInfoFile( saveInfoFileName, &fileItem );
-		}
+    f = fopen (saveInfoFileName, "rb");
+    if (!f) {
+        memset (theInfo, 0, sizeof (*theInfo));
+        f = fopen (saveInfoFileName, "wb");
+        if (!f)
+            return -1;
+        n = fwrite (&defaultsaveinfo, 1, sizeof (defaultsaveinfo), f);
+        fclose (f);
+        if (n != sizeof (defaultsaveinfo))
+            return -1;
+        *theInfo = defaultsaveinfo;
+        return 0;
+    }
 
-	if ( fileItem < 0 || err )
-		{
-		printf( "failed to open and/or create nvram file");
-		memset( theInfo, 0, sizeof( SaveInfoRec ));	// all zeroes is good starting state
-		return fileItem;
-		}
-
-	// If we make it here, we either just opened our file or we called createopen...
-	// which created the file and wrote our default data into it.
-
-	err = ReadDiskFile( fileItem, (ubyte *) theInfo, sizeof( SaveInfoRec ) );
-
-	err = CloseDiskFile( fileItem );
-
-	return err;
-}
-
-/*
-**	LoadSaveInfo()
-**
-**	Load the save info from NVRAM if it exists. Otherwise create it & write it.
-*/
-static Err
-WriteSaveInfo( struct SaveInfoRec *theInfo, char *savmsg )
-{
-	Item 	fileItem;
-	Err		err = 0;
-
-	fileItem = OpenDiskFile( saveInfoFileName );
-	if ( fileItem < 0 )
-		{
-		printf( "failed to open");
-		return fileItem;
-		}
-
-	err = WriteDiskFile( fileItem, (ubyte *) theInfo, sizeof( SaveInfoRec ) );
-
-	err = CloseDiskFile( fileItem );
-
-	if (err < 0)
-		rendermessage (240, "There was\nan error.\nData not\nsaved.");
-	else
-		rendermessage (120, savmsg);
-
-	return err;
-}
-
-/*
-**	CreateOpenSaveInfoFile()
-**
-**	Create a new NVRAM file if we can. If we succeed, open it, alloc room for it,
-**	and fill it with our default data.
-*/
-
-static Err
-CreateOpenSaveInfoFile( char *fileName, Item *fileItem )
-{
-	Err err;
-	Item ioReqItem;
-	uint32 numberOfBlocks, blockSize;
-
-	*fileItem = CreateFile( fileName );
-	CHECKRESULT( "CreateNVRAMFILE:Create File", *fileItem );
-	err = ( *fileItem < 0 ) ? *fileItem : 0;
-
-	if ( err == 0 )
-		{
-		*fileItem = OpenDiskFile( fileName );
-		CHECKRESULT( "CreateBVRANFUKELOpenDiskFile", *fileItem );
-		err = ( *fileItem < 0 ) ? *fileItem : 0;
-
-		if ( err == 0 )
-			{
-			err = GetFileBlockSize( *fileItem, &blockSize );
-			CHECKRESULT( "createNVRAMFile:GetFileBlockSize", err );
-
-			if ( err == 0 )
-				{
-				numberOfBlocks = (sizeof (SaveInfoRec) + blockSize - 1) / blockSize;
-
-				ioReqItem = CreateIOReq( NULL, 0, *fileItem, 0 );
-				CHECKRESULT( "CreateNVRAMFile:CreateIOReq", ioReqItem );
-
-				if ( ioReqItem >= 0 )
-					{
-					IOInfo fileInfo;
-
-					memset( &fileInfo, 0, sizeof(IOInfo) );
-
-					fileInfo.ioi_Command = FILECMD_ALLOCBLOCKS;
-					fileInfo.ioi_Offset = numberOfBlocks;
-
-					err = DoIO( ioReqItem, &fileInfo );
-					CHECKRESULT( "CreateNVRAMFile:DoIO", err );
-
-					err = DeleteIOReq( ioReqItem );
-					CHECKRESULT( "CreateNVRAMFile:DeleteIOReq", err );
-					}
-				else
-					{
-					err = ioReqItem;
-					}
-				}
-
-			if ( err == 0 )
-				{
-				err = WriteDiskFile( *fileItem, (ubyte *) &defaultsaveinfo, sizeof( SaveInfoRec ) );
-				CHECKRESULT( "CreateNVRAMFile:WriteDiskFile", err );
-				}
-			}
-		}
-
-	return err;
-}
-
-
-static Err
-WriteDiskFile( Item fileItem, ubyte *data, int32 numberOfBytes )
-{
-	int32 err;
-	IOInfo fileInfo;
-	Item ioReqItem;
-
-	ioReqItem = CreateIOReq( NULL, 0, fileItem, 0 );
-	CHECKRESULT( "WriteNVRAMFile:CreateIOReq", ioReqItem );
-
-	if ( ioReqItem >= 0 )
-		{
-		memset( &fileInfo, 0, sizeof(IOInfo) );
-
-		fileInfo.ioi_Command = CMD_WRITE;
-		fileInfo.ioi_Send.iob_Buffer = data;
-		fileInfo.ioi_Send.iob_Len = (int) (numberOfBytes & ~3);
-
-		fileInfo.ioi_Offset = 0;
-
-		err = DoIO( ioReqItem, &fileInfo );
-		CHECKRESULT( "WriteNVRAMFIle:DoIO", err );
-
-		err = DeleteIOReq( ioReqItem );
-		CHECKRESULT( "WriteNVRamFile:DeleteIOReq", err );
-		}
-	else
-		{
-		err = ioReqItem;
-		}
-
-	return err;
+    n = fread (theInfo, 1, sizeof (*theInfo), f);
+    fclose (f);
+    if (n != sizeof (*theInfo)) {
+        memset (theInfo, 0, sizeof (*theInfo));
+        return -1;
+    }
+    return 0;
 }
 
 static Err
-ReadDiskFile( Item fileItem, ubyte *data, int32 numberOfBytes )
+WriteSaveInfo (struct SaveInfoRec *theInfo, char *savmsg)
 {
-	int32 err;
-	IOInfo fileInfo;
-	Item ioReqItem;
+    FILE *f;
+    size_t n;
 
-	ioReqItem = CreateIOReq( NULL, 0, fileItem, 0 );
-	CHECKRESULT( "ReadNVRAMFile:CreateIOReq", ioReqItem );
-
-	if ( ioReqItem >= 0 )
-		{
-		memset( &fileInfo, 0, sizeof(IOInfo) );
-
-		fileInfo.ioi_Command = CMD_READ;
-
-		fileInfo.ioi_Recv.iob_Buffer = data;
-		fileInfo.ioi_Recv.iob_Len = numberOfBytes;
-
-		fileInfo.ioi_Offset = 0;
-
-		err = DoIO( ioReqItem, &fileInfo );
-		CHECKRESULT( "ReadNVRAMFIle:DoIO", err );
-
-		err = DeleteIOReq( ioReqItem );
-		CHECKRESULT( "ReadNVRamFile:DeleteIOReq", err );
-		}
-	else
-		{
-		err = ioReqItem;
-		}
-
-	return err;
-}
-
-static Err
-GetFileBlockSize( Item fileItem, uint32* blockSize )
-{
-	int32 		err;
-	IOInfo 		fileInfo;
-	FileStatus	status;
-	Item 		ioReqItem;
-
-	ioReqItem = CreateIOReq( NULL, 0, fileItem, 0 );
-	CHECKRESULT( "GetFileBlockSize:CreateIOReq", ioReqItem );
-
-	if ( ioReqItem >= 0 )
-		{
-		memset( &fileInfo, 0, sizeof(IOInfo) );
-
-		fileInfo.ioi_Command = CMD_STATUS;
-
-		fileInfo.ioi_Recv.iob_Buffer = &status;
-		fileInfo.ioi_Recv.iob_Len = sizeof( FileStatus );
-
-		err = DoIO( ioReqItem, &fileInfo );
-		CHECKRESULT( "GetFileBlockSize:DoIO", err );
-
-		err = DeleteIOReq( ioReqItem );
-		CHECKRESULT( "GetFileBlockSize:DeleteIOReq", err );
-
-		if ( err == 0 )
-			{
-			*blockSize = status.fs.ds_DeviceBlockSize;
-			}
-		}
-	else
-		{
-		err = ioReqItem;
-		}
-
-	return err;
+    f = fopen (saveInfoFileName, "wb");
+    if (!f)
+        return -1;
+    n = fwrite (theInfo, 1, sizeof (*theInfo), f);
+    fclose (f);
+    if (n != sizeof (*theInfo)) {
+        rendermessage (240, "There was\nan error.\nData not\nsaved.");
+        return -1;
+    }
+    rendermessage (120, savmsg);
+    return 0;
 }

@@ -1,1506 +1,687 @@
-/***************************************************************
-**
-** SoundInterface.c
-**
-** Written by Peter Commons with a lot of help (and code) from Phil Burk.
-**
-** This is a very high level sound library of sorts. It is designed to be very easy to
-** use by other programmers to get lots of cool sound stuff for their programs without
-** having to learn all about the sound toolbox.
-**
-** All calls to the sound library are made through the CallSound() function.
-** Anyone who uses the sound library must include SoundInterface.h in their code.
-** Look in SoundInterface.h for a lot of information on how to call the sound library.
-**
-** Copyright (c) 1993, 3DO Company.
-** This program is proprietary and confidential.
-**
-Change History:
-07/27/93	Initial Version.
-08/02/93	Added stuff for variable rate samples and volume control.
-08/04/93	Made the stop spool command synchronous (i.e. it waits until the sound has
-			really stopped before returning). This is so you can stop a sound and start
-			a new one right up without getting a "can't start, still running" error message.
-08/10/93	Grab all knobs at the beginning, so as to avoid slowing stuff down when actually
-			playing sounds. Fixed bug with variable rate samples (setting the rate).
-			Removed instrument file name parameter from load RAM sound; the instrument
-			is now determined automagically.
-08/11/93	Altered CallSound() prototype for Leo.
-08/13/93	Add checks for setting rate (freq) too high or too low.
-08/16/93	Removed isStereo flag from LoadRAMSound. Stereo/Mono determination is done
-			automatically. Added kStopFadeSpoolSound command (new data structure, too)
-			which will stop the currently spooled sound over a given number of seconds.
-08/16/93.2	Call OpenAudioFolio() in all threads that do audio calls.
-08/18/93	Add: SoundLib already initialized error. Remove one point from spooler code.
-			Add: SoundID of 0 invalid error. Add: DisconnectInstruments() calls when
-			unloading a RAM sound.
-08/30/93	Add: kIsSoundSpooling function. Returns true if sound currently spooling.
-			Modified to work under DragonTail5.
-09/01/93	Add instrument cacheing. The first MAX_CACHED_INSTRUMENTS are cached in RAM
-			and not reloaded from disk every time they're used. Once the cache is full,
-			there is no replacement strategy.
-09/08/93	Moved away from a channel-dependent philosophy. You can now load more sounds
-			than you have channels for or than you have room for on the dsp. Intruments
-			will get loaded into the dsp and unloaded as needed.
-09/16/93	Space is now reserved in the dsp for a spooler instrument (currently I use
-			halfmono8.dsp to determine the size because it takes up a lot of room and trying
-			to use fixedstereosample.dsp didn't save enough). This should prevent the loading of too many
-			RAM sounds precluding the use of the dsp for spooling.
-***************************************************************/
-
-#include "types.h"
-#include "debug.h"
-#include "operror.h"
-#include "filefunctions.h"
-#include "audio.h"
-#include "music.h"
-#include "soundfile.h"
-#include "operamath.h"
-
+#include "sdl3_3do.h"
+#include "castle.h"
 #include "soundinterface.h"
+#include "sound.h"
+#include "app_proto.h"
 
+#define MAX_SDL_VOICES 24
+#define MAX_SDL_SOUNDS 128
 
-/*
-**	Standard 3DO Defines
-*/
-
-#define	PRT(x)	/* { printf x; } */
-#define	ERR(x)	PRT(x)
-#define	DBUG(x)	/* PRT(x) */
-
-// PVC This might be a bit big
-#define STACKSIZE (10000)
-
-#define CHECKRESULT(val,name) \
-	if (val < 0) \
-	{ \
-		result = val; \
-		ERR(("SoundLibErr: Failure in %s: $%x\n", name, val)); \
-		PrintfSysErr(result); \
-		goto error; \
-	}
-
-#define CHECKPTR(val,name) \
-	if (val == 0) \
-	{ \
-		result = -1; \
-		ERR(("SoundLibErr: Failure in %s\n", name)); \
-		goto error; \
-	}
-
-// PVC These might be a bit big
-#define NUMBLOCKS (24)
-#define BLOCKSIZE (2048)
-#define BUFSIZE (NUMBLOCKS*BLOCKSIZE)
-#define NUMBUFFS  (2)
-
-
-/*
-**	Internal Forward Declarations
-*/
-
-static int32 InitializeSoundLibrary( void );
-static int32 SetMixerLevels( int32 theLevel );
-static int32 CleanupSoundLibrary( void );
-static int32 SpoolASound( SpoolSoundPtr spoolSndPtr );
-static int32 StopSpoolingSound( void );
-static int32 StopSpoolingSoundFade( int32 seconds );
-static void  StopSpoolOnFadeThread( void );
-static void  SpoolSoundFileThread( void );
-static int32 LoadRAMSound( LoadRAMSoundPtr loadSndPtr );
-static int32 AssignChannels( SoundDataPtr theSound, int32 mustSucceed );
-static int32 UnassignChannels( SoundDataPtr theSound );
-static int32 MyUnloadInstrument( SoundDataPtr chInfo );
-static int32 FindEmptyChannel( void );
-static Item	 MyLoadInstrument( char *instrName );
-static int32 UnloadRAMSound( int32 soundID );
-static int32 StartRAMSound( int32 soundID );
-static int32 StopRAMSound( int32 soundID );
-static int32 SetRAMSoundFreq( SetRAMSoundPtr setSndPtr );
-static int32 SetRAMSoundAmpl( SetRAMSoundPtr setSndPtr );
-static int32 FlushInstrument( Item SamplerIns );
-
-/*
-**	Main Internal Variables
-*/
-
-static	int32	soundLibraryIntialized = false;			// Is sound library initialized?
-static	ulong	spoolerOuttaHereSignal = 0;				// Spooler Is Done Signal
-static	ulong	spoolerFaderOuttaHereSignal = 0;		// Spooler Fader Is Done Signal
-static	ulong	spoolerHasStoppedSignal = 0;			// Spooler Is Done Stopping a Sound
-static	int32	soundLibraryMainLevel = MAXAMPLITUDE;	// Main Volume Level
-
-/*
-**	RAM-Resident Sound Internal Variables
-*/
-
-static	SoundDataRec	sounds[kMaxRamSounds]; // Info about each RAM resident sound
-static	int32			numSoundsAssigned;
-static	int32			assignQueue[kMaxRamSounds];	// List of sounds assigned in the order
-												// they were assigned. Unassign the 0th element
-												// in the queue whenever we need room.
-
-/*
-**	Mixer Internal Variables
-*/
-
-static	Item 	MixerTmp = -1;
-static	Item 	MixerIns = -1;
-static	char	mixerFileName[50] = kMixerFileName;
-static	char	envelopeFileName[50] = kEnvelopeFileName;
-static	char	spoolSaveFileName[50] = kSpoolerRoomSaveName;
-static	Item	leftGainKnob[kNumChannels];
-static	Item	rightGainKnob[kNumChannels];
-
-/*
-**	Sound Spooling Internal Variables
-*/
-
-static Item 	spoolerThread = -1;			// Thread that does spooling
-static Item 	spoolerFaderThread = -1;	// Thread that does spooling fade
-static int32 	spoolerRunning = false;		// Is a sound currently being spooled? If not, the
-											// spooler thread is just hanging out
-static int32	spoolerNumReps = 0;			// reps left to play
-static	char *	spoolerFileName;			// Pointer to string of name of file to play
-static int32	spoolerAmplitude;			// Volume to set for spooling
-static	ulong	spoolerStartSignal = 0;
-static	ulong	spoolerStopSignal = 0;
-static	ulong	spoolerQuitSignal = 0;
-static	DataTimePair 	spoolerEnvPoints[4];
-static	ulong	spoolerStopOnFadeSignal = 0;
-static	ulong	spoolerFaderQuitSignal = 0;
-static	int32	spoolerFaderTime = 0;
-static	int8	spoolerFading = FALSE;
-
-static	SoundFilePlayer *spoolerSFP = nil;
-
-static	Item	spoolerEnvIns = -1;		// Envelope used on spooler to do fades
-static	Item	spoolerRoomIns = -1;	// When a sound isn't being spooled, this instrument
-										// is allocated to keep room for a spooled sound in the dsp.
-
-//	DSP Instrument cache
-
-static	int32	numCachedInstrs = 0;
-static	char	cachedInstrName[MAX_CACHED_INSTRUMENTS][100];
-static	Item	cachedInstrItem[MAX_CACHED_INSTRUMENTS];
-
-// The Big Lollapalooza
-// Go wild on error checking! e.g. if they stop a sound that hasn't started...
-
-/*
-**	CallSound()
-*/
-int32
-CallSound( union CallSoundRec *soundPtr )
+typedef struct SDL3DOSample
 {
-	int32 result = 0;
+    uint8 *data;
+    int len;
+    int freq;
+    int channels;
+} SDL3DOSample;
 
-	if ( soundPtr->whatIWant != kInitializeSound && soundLibraryIntialized == false )
-		{
-		ERR(("SoundLibErr: Please initialize the sound library before making any other calls.\n"));
-		return (-1);
-		}
-	if ( soundPtr->whatIWant == kInitializeSound && soundLibraryIntialized )
-		{
-		ERR(("SoundLibErr: Sound Library already initialized.\n"));
-		return (-1);
-		}
+typedef struct SDL3DOVoice
+{
+    SDL_AudioStream *stream;
+    int soundID;
+    int active;
+    SDL3DOSample sample;
+} SDL3DOVoice;
 
-	switch ( soundPtr->whatIWant )
-		{
-		case kInitializeSound:
-			PRT(("Initializing Sound Lib\n"));
-			result = InitializeSoundLibrary();
-			break;
+static SDL_AudioDeviceID gAudioDevice;
+static SDL3DOVoice gVoices[MAX_SDL_VOICES];
+static SDL3DOVoice gMusic;
+static SDL3DOSample gSounds[MAX_SDL_SOUNDS];
+static int gAudioReady;
+static int gMusicLoop;
+static SDL_AudioStream *gMovieAudioStream;
+static int gMovieAudioActive;
+static uint64 gMovieAudioDurationUs;
 
-		case kCleanupSound:
-			PRT(("Cleaning up Sound Lib\n"));
-			result = CleanupSoundLibrary();
-			break;
+static uint16 be16(const uint8 *p) { return (uint16)(((uint16)p[0] << 8) | p[1]); }
+static uint32 fourcc(const uint8 *p) { return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | p[3]; }
 
-		case kSpoolSound:
-			PRT(("Spooling Sound\n"));
-			result = SpoolASound( &soundPtr->spoolSound );
-			break;
+static uint32 movie_be32(const uint8 *p) { return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | p[3]; }
+static int decode_sdx2(const uint8 *src, int srcLen, int channels, uint8 **outData, int *outLen);
 
-		case kStopSpoolingSound:
-			PRT(("Stopping Spooled Sound\n"));
-			result = StopSpoolingSound();
-			break;
+int SDL3_3DO_StartMovieAudio(const uint8 *data, size_t size)
+{
+    uint32_t position;
+    uint32_t fileSize;
+    uint32_t compressedSize = 0;
+    uint32_t sampleRate = 0;
+    uint32_t channels = 0;
+    uint32_t bitDepth = 0;
+    uint8 *compressed = NULL;
+    uint8 *decoded = NULL;
+    int decodedLen = 0;
+    SDL_AudioSpec src;
+    int haveHeader = 0;
 
-		case kStopFadeSpoolSound:
-			PRT(("Fading Spooled Sound\n"));
-			result = StopSpoolingSoundFade( soundPtr->fadeSound.seconds );
-			break;
+    if (!gAudioReady || !data || size < 8u || size > 0xFFFFFFFFu)
+        return 0;
+    SDL3_3DO_StopMovieAudio();
+    fileSize = (uint32_t)size;
+    position = movie_be32(data + 4u);
+    if (position < 8u || position > fileSize)
+        position = 0u;
 
-		case kBeQuiet:
-			PRT(("Making RAM Sounds Quiet\n"));
-			soundLibraryMainLevel = 0;
-			result = SetMixerLevels( soundLibraryMainLevel );
-			break;
+    while (position + 8u <= fileSize)
+    {
+        const uint8 *chunk = data + position;
+        uint32_t chunkSize = movie_be32(chunk + 4u);
+        if (chunkSize < 8u || position + chunkSize > fileSize)
+            return 0;
+        if (memcmp(chunk, "SNDS", 4) == 0 && chunkSize >= 64u &&
+            memcmp(chunk + 16u, "SHDR", 4) == 0)
+        {
+            bitDepth = movie_be32(chunk + 40u);
+            sampleRate = movie_be32(chunk + 44u);
+            channels = movie_be32(chunk + 48u);
+            if (movie_be32(chunk + 52u) != 0x53445832u)
+                return 0;
+            haveHeader = 1;
+        }
+        if (memcmp(chunk, "SNDS", 4) == 0 && chunkSize >= 24u &&
+            memcmp(chunk + 16u, "SSMP", 4) == 0)
+        {
+            uint32_t blockSize = movie_be32(chunk + 20u);
+            if (blockSize > chunkSize - 24u)
+                return 0;
+            compressedSize += blockSize;
+        }
+        position += chunkSize;
+    }
 
-		case kBeNoisy:
-			PRT(("Making RAM Sounds Noisy\n"));
-			soundLibraryMainLevel = MAXAMPLITUDE;
-			result = SetMixerLevels( soundLibraryMainLevel );
-			break;
+    if (!haveHeader || !compressedSize || !sampleRate ||
+        (channels != 1u && channels != 2u) || bitDepth != 16u)
+        return 0;
 
-		case kLoadRAMSound:
-			PRT(("load RAM Sound\n"));
-			result = LoadRAMSound( &soundPtr->loadSound );
-			break;
+    compressed = (uint8 *)malloc(compressedSize);
+    if (!compressed)
+        return 0;
+    position = 0u;
+    {
+        uint32_t written = 0u;
+        while (position + 8u <= fileSize && written < compressedSize)
+        {
+            const uint8 *chunk = data + position;
+            uint32_t chunkSize = movie_be32(chunk + 4u);
+            if (chunkSize < 8u || position + chunkSize > fileSize)
+            {
+                free(compressed);
+                return 0;
+            }
+            if (memcmp(chunk, "SNDS", 4) == 0 && chunkSize >= 24u &&
+                memcmp(chunk + 16u, "SSMP", 4) == 0)
+            {
+                uint32_t blockSize = movie_be32(chunk + 20u);
+                if (blockSize > chunkSize - 24u || blockSize > compressedSize - written)
+                {
+                    free(compressed);
+                    return 0;
+                }
+                memcpy(compressed + written, chunk + 24u, blockSize);
+                written += blockSize;
+            }
+            position += chunkSize;
+        }
+        if (written != compressedSize)
+        {
+            free(compressed);
+            return 0;
+        }
+    }
 
-		case kUnloadRAMSound:
-			PRT(("unload RAM Sound\n"));
-			result = UnloadRAMSound( soundPtr->ramSound.soundID);
-			break;
+    if (decode_sdx2(compressed, (int)compressedSize, (int)channels, &decoded, &decodedLen) < 0)
+    {
+        free(compressed);
+        return 0;
+    }
+    free(compressed);
 
-		case kStartRAMSound:
-			PRT(("start RAM Sound\n"));
-			result = StartRAMSound( soundPtr->ramSound.soundID );
-			break;
-
-		case kStopRAMSound:
-			PRT(("stop RAM Sound\n"));
-			result = StopRAMSound( soundPtr->ramSound.soundID );
-			break;
-
-		case kSetRAMSoundFreq:
-			PRT(("Set RAM Sound Frequency\n"));
-			result = SetRAMSoundFreq( &soundPtr->setSound );
-			break;
-
-		case kSetRAMSoundAmpl:
-			PRT(("Set RAM Sound Amplitude\n"));
-			result = SetRAMSoundAmpl( &soundPtr->setSound );
-			break;
-
-		case kIsSoundSpooling:
-			result = spoolerRunning;
-			break;
-
-		default:
-			ERR(("SoundLibErr: CallSound Function Doesn't Know That Operation!\n"));
-			result = -1;
-			break;
-		}
-
-	return ( result );
+    memset(&src, 0, sizeof(src));
+    src.format = SDL_AUDIO_S16LE;
+    src.channels = (int)channels;
+    src.freq = (int)sampleRate;
+    gMovieAudioStream = SDL_CreateAudioStream(&src, NULL);
+    if (!gMovieAudioStream)
+    {
+        free(decoded);
+        return 0;
+    }
+    if (!SDL_BindAudioStream(gAudioDevice, gMovieAudioStream) ||
+        !SDL_PutAudioStreamData(gMovieAudioStream, decoded, decodedLen) ||
+        !SDL_FlushAudioStream(gMovieAudioStream))
+    {
+        SDL_UnbindAudioStream(gMovieAudioStream);
+        SDL_DestroyAudioStream(gMovieAudioStream);
+        gMovieAudioStream = NULL;
+        free(decoded);
+        return 0;
+    }
+    free(decoded);
+    gMovieAudioActive = 1;
+    gMovieAudioDurationUs = ((uint64)(uint32_t)decodedLen * 1000000u) /
+                            ((uint64)sampleRate * channels * (uint32_t)sizeof(int16));
+    return 1;
 }
 
-
-/*
-**	InitializeSoundLibrary()
-*/
-static int32
-InitializeSoundLibrary( void )
+int SDL3_3DO_IsMovieAudioPlaying(void)
 {
-	int32 	result = noErr;
-	int32 	Priority, i;
-
-	if ( soundLibraryIntialized )
-		{
-		ERR(("SoundLibErr: Sound Library has already been initialized\n"));
-		result = -1;
-		}
-
-	if ( result == noErr )
-		{
-		result = OpenAudioFolio();
-		if ( result )
-			{
-			ERR(("SoundLibErr: Audio Folio could not be opened!\n"));
-			}
-		}
-
-	if ( result == noErr )
-		{
-		Priority = 180;
-		spoolerThread = CreateThread("SoundSpooler", Priority, SpoolSoundFileThread, STACKSIZE);
-		CHECKRESULT(spoolerThread,"CreateThread");
-		spoolerOuttaHereSignal = AllocSignal( 0 );
-
-		spoolerFaderThread = CreateThread("SoundSpoolerFader", Priority, StopSpoolOnFadeThread, STACKSIZE);
-		CHECKRESULT(spoolerThread,"CreateThread");
-		spoolerFaderOuttaHereSignal = AllocSignal( 0 );
-
-		spoolerHasStoppedSignal = AllocSignal( 0 );
-
-		spoolerEnvIns = LoadInstrument( envelopeFileName, 0, 100 );
-		CHECKRESULT( spoolerEnvIns, "LoadInstrument" );
-		}
-
-	if ( result == noErr )
-		{
-		for ( i = 0; i < kMaxRamSounds; i++ )
-			{
-			sounds[i].soundID = 0;	// No Sound Allocated To Start
-			}
-
-		MixerTmp = LoadInsTemplate( mixerFileName, 0 );
-		CHECKRESULT( MixerTmp, "LoadInsTemplate" );
-
-		MixerIns = AllocInstrument( MixerTmp, 20);
-		CHECKRESULT( MixerIns, "AllocInstrument" );
-
-		// Set the input from each channel to each speaker side in the mixer to the maximum.
-
-		result = SetMixerLevels( MAXAMPLITUDE );
-		CHECKRESULT( result, "SetMixerLevels" );
-
-		// Set the global output volume from the mixer to maximum
-
-		/* Mixer must be started */
-
-		StartInstrument( MixerIns, NULL );
-
-		/* Grab all mixer knobs */
-
-		for ( i = 0; i < kNumChannels; i++ )
-			{
-			char	aName[50];
-
-			sprintf( aName, "LeftGain%d", i );
-			leftGainKnob[i] = GrabKnob( MixerIns, aName );
-			CHECKRESULT( leftGainKnob[i], "GrabKnob" );
-
-			sprintf( aName, "RightGain%d", i );
-			rightGainKnob[i] = GrabKnob( MixerIns, aName );
-			CHECKRESULT( rightGainKnob[i], "GrabKnob" );
-			}
-
-		/* No cached instruments to start */
-
-		numCachedInstrs = 0;
-
-		}
-
-	error:
-	soundLibraryIntialized = ( result == noErr);
-
-	return result;
+    if (!gMovieAudioStream || !gMovieAudioActive)
+        return 0;
+    if (SDL_GetAudioStreamQueued(gMovieAudioStream) == 0 &&
+        SDL_GetAudioStreamAvailable(gMovieAudioStream) == 0)
+    {
+        SDL3_3DO_StopMovieAudio();
+        return 0;
+    }
+    return 1;
 }
 
-/*
-**	SetMixerLevels()
-*/
-static int32
-SetMixerLevels( int32 theLevel )
+void SDL3_3DO_StopMovieAudio(void)
 {
-	int32 	result = noErr;
-	int32 	i, newLevelL, newLevelR;
-	int32	channelIsHit = nil;
-
-
-	// This sets the mixer levels harshly; we probably want to throw Phil's
-	// envelope code in here at some point.
-
-	for ( i = 0; i < kMaxRamSounds; i++ )
-		{
-		if ( sounds[i].soundID )
-			{
-			if ( sounds[i].channel[0] >= 0 )
-				{
-				channelIsHit |= (1 << sounds[i].channel[0]);
-
-				newLevelL = ( ((sounds[i].amplitude * sounds[i].balance) / 100)
-											/ kNumChannels) * AUDIO_MULTIPLIER;
-
-				newLevelR = ( ((sounds[i].amplitude * (100 - sounds[i].balance)) / 100)
-											/ kNumChannels)  * AUDIO_MULTIPLIER;
-
-				if ( sounds[i].channel[1] >= 0 )	// stereo
-					{
-					channelIsHit |= (1 << sounds[i].channel[1]);
-
-					TweakKnob( leftGainKnob[sounds[i].channel[0]], newLevelL );
-					TweakKnob( rightGainKnob[sounds[i].channel[0]], 0 );
-
-					TweakKnob( leftGainKnob[sounds[i].channel[1]], 0 );
-					TweakKnob( rightGainKnob[sounds[i].channel[1]], newLevelR );
-					}
-				else		// mono
-					{
-					TweakKnob( leftGainKnob[sounds[i].channel[0]], newLevelL );
-					TweakKnob( rightGainKnob[sounds[i].channel[0]], newLevelR );
-					}
-				}
-			}
-		}
-
-	// All unused channels should have their levels set to zero
-
-	for ( i = 0; i < kNumChannels; i++ )
-		{
-		if ( (channelIsHit & (1 << i)) == nil )
-			{
-			TweakKnob( leftGainKnob[i], 0 );
-			TweakKnob( rightGainKnob[i], 0 );
-			}
-		}
-
-
-	return result;
+    if (gMovieAudioStream)
+    {
+        SDL_UnbindAudioStream(gMovieAudioStream);
+        SDL_DestroyAudioStream(gMovieAudioStream);
+        gMovieAudioStream = NULL;
+    }
+    gMovieAudioActive = 0;
+    gMovieAudioDurationUs = 0;
 }
 
-
-/*
-**	CleanupSoundLibrary()
-*/
-static int32
-CleanupSoundLibrary( void )
+uint64 SDL3_3DO_GetMovieAudioDurationUs(void)
 {
-	int32 result = noErr;
-	int32 i;
-
-	if ( !soundLibraryIntialized )
-		{
-		ERR(("SoundLibErr: Sound Library has not been initialized\n"));
-		result = -1;
-		}
-	else
-		{
-		/* Clean up spooler */
-
-		SendSignal( spoolerThread, spoolerQuitSignal );
-		WaitSignal( spoolerOuttaHereSignal );
-		DeleteThread( spoolerThread );
-		spoolerThread = -1;
-
-		FreeSignal( spoolerOuttaHereSignal );
-		spoolerOuttaHereSignal = 0;
-
-		SendSignal( spoolerFaderThread, spoolerFaderQuitSignal );
-		WaitSignal( spoolerFaderOuttaHereSignal );
-		DeleteThread( spoolerFaderThread );
-		spoolerFaderThread = -1;
-
-		FreeSignal( spoolerFaderOuttaHereSignal );
-		spoolerFaderOuttaHereSignal = 0;
-
-		FreeSignal( spoolerHasStoppedSignal );
-		spoolerHasStoppedSignal = 0;
-
-		FreeInstrument( spoolerEnvIns );
-		spoolerEnvIns = -1;
-
-		/* Clean up any open RAM resident instruments */
-		/* Free all mixer gain knobs */
-
-		for ( i = 0; i < kMaxRamSounds; i++ )
-			{
-			if ( sounds[i].soundID )
-				{
-				UnloadRAMSound( sounds[i].soundID );
-				}
-			}
-
-		for ( i = 0; i < kNumChannels; i++ )
-			{
-			ReleaseKnob( leftGainKnob[i] );
-			ReleaseKnob( rightGainKnob[i] );
-			}
-
-		/* Unload all cached instruments */
-
-		for ( i = 0; i < numCachedInstrs; i++ )
-			{
-			UnloadInsTemplate( cachedInstrItem[i] );
-			}
-
-		/* Clean up Mixer */
-
-		FreeInstrument( MixerIns );
-		MixerIns = -1;
-		UnloadInsTemplate( MixerTmp );
-		MixerTmp = -1;
-
-		CloseAudioFolio();
-		}
-
-	soundLibraryIntialized = false;
-
-	return result;
+    return gMovieAudioDurationUs;
 }
 
-/*
-**	SpoolASound()
-*/
-static int32
-SpoolASound( SpoolSoundPtr spoolSndPtr )
+static int16 sdx2_delta[256];
+static int sdx2_table_ready;
+
+static void init_sdx2_table(void)
 {
- 	int32 result = 0;
-
-	if ( spoolerRunning  &&  !spoolerFading )
-		{
-		ERR(("SoundLibErr: Sound Currently Being Spooled; please stop it first.\n"));
-		result = -1;
-		}
-	else
-		{
-		if ( spoolSndPtr->fileToSpool == nil || spoolSndPtr->numReps == nil
-												|| spoolSndPtr->amplitude == nil )
-			{
-			ERR(("SoundLibErr: WARNING! Got a nil parameter that probably shouldn't be nil for SpoolSound\n"));
-			}
-
-		spoolerFileName = spoolSndPtr->fileToSpool;
-		spoolerNumReps = spoolSndPtr->numReps;
-		spoolerAmplitude = spoolSndPtr->amplitude;
-
-		if (spoolerFading) {
-			WaitSignal (spoolerHasStoppedSignal);
-			spoolerFading = FALSE;
-		}
-
-		SendSignal( spoolerThread, spoolerStartSignal );
-		}
-
-	return ( result );
+    int i, v;
+    if (sdx2_table_ready)
+        return;
+    for (i = -128; i <= 127; ++i)
+    {
+        v = i * i * 2;
+        if (i < 0)
+            v = -v;
+        sdx2_delta[i + 128] = (int16)v;
+    }
+    sdx2_table_ready = 1;
 }
 
-/*
-**	StopSpoolingSound()
-*/
-static int32
-StopSpoolingSound( void )
+static int decode_sdx2(const uint8 *src, int srcLen, int channels, uint8 **outData, int *outLen)
 {
-	int32 result = 0;
+    int16 *dst;
+    int i, ch;
+    int32 pred[2] = {0, 0};
 
-	if ( !spoolerRunning )
-		{
-		ERR(("SoundLibErr: Can't stop spooling; nothing playing.\n"));
-		result = -1;
-		}
-	else
-		{
-		SendSignal( spoolerThread, spoolerStopSignal );
-		WaitSignal( spoolerHasStoppedSignal );
-		spoolerFading = FALSE;
-		}
+    if (!src || srcLen <= 0 || !outData || !outLen)
+        return -1;
+    if (channels < 1 || channels > 2)
+        return -1;
 
-	return ( result );
+    init_sdx2_table();
+    dst = (int16 *)malloc((size_t)srcLen * sizeof(int16));
+    if (!dst)
+        return -1;
+
+    for (i = 0; i < srcLen; ++i)
+    {
+        int8 code = (int8)src[i];
+        ch = (channels == 2) ? (i & 1) : 0;
+        if ((code & 1) == 0)
+            pred[ch] = 0;
+        pred[ch] += sdx2_delta[(int)code + 128];
+        if (pred[ch] > 32767)
+            pred[ch] = 32767;
+        else if (pred[ch] < -32768)
+            pred[ch] = -32768;
+        dst[i] = (int16)pred[ch];
+    }
+
+    *outData = (uint8 *)dst;
+    *outLen = srcLen * (int)sizeof(int16);
+    return 0;
 }
 
-/*
-**	StopSpoolingSoundFade()
-*/
-static int32
-StopSpoolingSoundFade( int32 seconds )
+static void freesample(SDL3DOSample *s)
 {
-	int32 result = 0;
-
-	if ( seconds < 0 )
-		{
-		ERR(("SoundLibErr: Can't stop in negative seconds!.\n"));
-		result = -1;
-		}
-	else if ( seconds == 0 )	// just stop normally
-		{
-		result = StopSpoolingSound();
-		}
-	else if ( !spoolerRunning )
-		{
-		ERR(("SoundLibErr: Can't stop spooling; nothing playing.\n"));
-		result = -1;
-		}
-	else
-		{
-		spoolerFaderTime = seconds;
-		spoolerFading = TRUE;
-		SendSignal( spoolerFaderThread, spoolerStopOnFadeSignal );
-		}
-
-	return ( result );
+    if (s->data)
+        free(s->data);
+    memset(s, 0, sizeof(*s));
 }
 
-/*
-**	StopSpoolOnFadeThread()
-*/
-static void
-StopSpoolOnFadeThread( void )
+static int load_aifc(const char *filename, SDL3DOSample *out)
 {
-	int32 			SignalIn;
-	Item 			myParent = THREAD_PARENT;
+    uint8 *file = NULL, *p, *end, *ssndData = NULL;
+    size_t len = 0;
+    uint32 typ, comp = 0;
+    int channels = 1, bits = 16, freq = 11025, dataLen = 0;
+    int i;
 
-	if (OpenAudioFolio())
-	{
-		ERR(("SoundLibErr: Audio Folio could not be opened!\n"));
-	}
+    if (!filename || !out)
+        return -1;
+    if (!SDL3_3DO_LoadFile(filename, &file, &len))
+    {
+        fprintf(stderr, "SDL3 audio: cannot load %s (searched mounted 3DO image and disk)\n", filename);
+        return -1;
+    }
+    if (len == 0 || len > 64 * 1024 * 1024)
+    {
+        fprintf(stderr, "SDL3 audio: invalid file size for %s\n", filename);
+        free(file);
+        return -1;
+    }
+    p = file;
+    end = file + len;
+    if (end - p < 12 || fourcc(p) != 0x464f524du)
+    {
+        fprintf(stderr, "SDL3 audio: %s is not a FORM file\n", filename);
+        free(file);
+        return -1;
+    }
+    typ = fourcc(p + 8);
+    if (typ != 0x41494643u && typ != 0x41494646u)
+    {
+        fprintf(stderr, "SDL3 audio: %s is not AIFF/AIFC\n", filename);
+        free(file);
+        return -1;
+    }
+    p += 12;
+    while (p + 8 <= end)
+    {
+        uint32 ct = fourcc(p), sz = ((uint32)p[4] << 24) | ((uint32)p[5] << 16) | ((uint32)p[6] << 8) | p[7];
+        uint8 *q = p + 8;
+        if (q > end || sz > (uint32)(end - q))
+            break;
+        if (ct == 0x434f4d4du && sz >= 18)
+        {
+            channels = be16(q);
+            bits = be16(q + 6);
 
-	spoolerStopOnFadeSignal = AllocSignal(0);
-	spoolerFaderQuitSignal = AllocSignal(0);
+            {
+                int sign = (q[8] & 0x80) ? -1 : 1, exp = ((q[8] & 0x7f) << 8) | q[9];
+                uint64 mant = ((uint64)q[10] << 56) | ((uint64)q[11] << 48) | ((uint64)q[12] << 40) | ((uint64)q[13] << 32) | ((uint64)q[14] << 24) | ((uint64)q[15] << 16) | ((uint64)q[16] << 8) | q[17];
+                double m = (double)mant / 9223372036854775808.0;
+                double r = (exp ? ldexp(m, exp - 16383) : 0) * sign;
+                if (r >= 1000 && r <= 192000)
+                    freq = (int)(r + 0.5);
+            }
+            if (sz >= 22)
+                comp = fourcc(q + 18);
+        }
+        else if (ct == 0x53534e44u && sz >= 8)
+        {
+            uint32 off = ((uint32)q[0] << 24) | ((uint32)q[1] << 16) | ((uint32)q[2] << 8) | q[3];
+            if (off <= sz - 8)
+            {
+                ssndData = q + 8 + off;
+                dataLen = (int)(sz - 8 - off);
+            }
+        }
+        p = q + sz + (sz & 1);
+    }
 
-	while ( true )
-		{
-		SignalIn = WaitSignal( spoolerStopOnFadeSignal | spoolerFaderQuitSignal );
+    if (!ssndData || dataLen <= 0)
+    {
+        fprintf(stderr, "SDL3 audio: %s has no usable SSND chunk\n", filename);
+        free(file);
+        return -1;
+    }
+    if (channels < 1 || channels > 2)
+    {
+        fprintf(stderr, "SDL3 audio: %s has unsupported channel count %d\n", filename, channels);
+        free(file);
+        return -1;
+    }
 
-		if ( SignalIn & spoolerFaderQuitSignal )
-			{
-			break;
-			}
+    out->freq = freq;
+    out->channels = channels;
+    out->data = NULL;
+    out->len = 0;
 
-		spoolerEnvPoints[2].dtpr_Time = 200 + (1000 * spoolerFaderTime);
-		ReleaseInstrument( spoolerEnvIns, nil );
+    if (comp == 0x53445832u)
+    {
+        int decodedLen = 0;
+        if (bits != 16)
+        {
+            fprintf(stderr, "SDL3 audio: SDX2 %s advertises %d-bit samples; expected 16\n", filename, bits);
+            free(file);
+            return -1;
+        }
+        if (decode_sdx2(ssndData, dataLen, channels, &out->data, &decodedLen) < 0)
+        {
+            fprintf(stderr, "SDL3 audio: SDX2 decode failed for %s\n", filename);
+            free(file);
+            return -1;
+        }
+        out->len = decodedLen;
+        fprintf(stderr, "SDL3 audio: loaded %s: SDX2 %d Hz, %d ch, %d compressed bytes -> %d PCM bytes\n", filename, freq, channels, dataLen, decodedLen);
+        free(file);
+        return 0;
+    }
 
-		SleepAudioTicks( (spoolerFaderTime * 240) + 20 ); // Just hang out!
+    if (comp && comp != 0x4e4f4e45u && comp != 0x74776f73u && comp != 0x736f7774u)
+    {
+        fprintf(stderr, "SDL3 audio: unsupported AIFC compression '%c%c%c%c' in %s\n",
+                (int)((comp >> 24) & 255), (int)((comp >> 16) & 255), (int)((comp >> 8) & 255), (int)(comp & 255), filename);
+        free(file);
+        return -1;
+    }
 
-		SendSignal( spoolerThread, spoolerStopSignal );
-		}
+    if (bits == 16)
+    {
+        int n = dataLen / 2;
+        int16 *d = (int16 *)malloc((size_t)n * 2);
+        if (!d)
+        {
+            free(file);
+            return -1;
+        }
+        for (i = 0; i < n; i++)
+        {
+            uint8 *s = ssndData + i * 2;
+            uint16 v = (comp == 0x736f7774u) ? (uint16)(s[0] | ((uint16)s[1] << 8)) : be16(s);
+            d[i] = (int16)v;
+        }
+        out->data = (uint8 *)d;
+        out->len = n * 2;
+    }
+    else if (bits == 8)
+    {
+        int16 *d = (int16 *)malloc((size_t)dataLen * 2);
+        if (!d)
+        {
+            free(file);
+            return -1;
+        }
 
-	if ( spoolerStopOnFadeSignal ) FreeSignal( spoolerStopOnFadeSignal );
-	spoolerStopOnFadeSignal = 0;
-	if ( spoolerFaderQuitSignal ) FreeSignal( spoolerFaderQuitSignal );
-	spoolerFaderQuitSignal = 0;
+        for (i = 0; i < dataLen; i++)
+            d[i] = (int16)(((int)(int8)ssndData[i]) << 8);
+        out->data = (uint8 *)d;
+        out->len = dataLen * 2;
+    }
+    else
+    {
+        fprintf(stderr, "SDL3 audio: unsupported %d-bit PCM in %s\n", bits, filename);
+        free(file);
+        return -1;
+    }
 
-	CloseAudioFolio();
-
-	/* Tell parent task that I've cleaned up and can be killed. */
-
-	SendSignal(myParent, spoolerFaderOuttaHereSignal );
-
-	/* Wait for parent to kill me (quick and painlessly, without memory loss, hopefully. */
-
-	WaitSignal(0);
-
+    fprintf(stderr, "SDL3 audio: loaded %s: PCM %d Hz, %d ch, %d-bit, %d bytes\n", filename, freq, channels, bits, out->len);
+    free(file);
+    return 0;
 }
 
-
-/****************************************/
-/* Sound Spooling Background Thread		*/
-/****************************************/
-
-/*
-**	SpoolSoundFileThread()
-*/
-static void
-SpoolSoundFileThread( void )
+static void stop_voice(SDL3DOVoice *v)
 {
-	int32 			result = 0;
-	int32 			SignalIn, spoolServiceSignal;
-	Item 			myParent = THREAD_PARENT;
-	Item			spoolerEnvAttachment;
-	Item			spoolerEnvelope;
-
-	spoolerRunning = false;
-
-	/* Initialize audio, return if error. */
-
-	if (OpenAudioFolio())
-		{
-		ERR(("SoundLibErr: Audio Folio could not be opened!\n"));
-		}
-
-	/* Set up Sound File Player Once at Beginning */
-
-	spoolerSFP = CreateSoundFilePlayer ( NUMBUFFS, BUFSIZE, NULL );
-	CHECKPTR(spoolerSFP, "CreateSoundFilePlayer");
-
-	// Set room aside for later use
-
-	spoolerRoomIns = LoadInstrument( spoolSaveFileName, 0, 100 );
-	CHECKRESULT( spoolerRoomIns, "LoadInstrument" );
-
-	/* Set up spooler signals */
-
-	spoolerStartSignal = AllocSignal(0);
-	spoolerStopSignal = AllocSignal(0);
-	spoolerQuitSignal = AllocSignal(0);
-	spoolServiceSignal = 0;		// Allocated by Spool File Player
-
-	/* Here's our infinite loop - keep waiting or playing until it is time to quit */
-
-	while ( true )
-		{
-		SignalIn = WaitSignal( spoolerStartSignal | spoolerStopSignal | spoolerQuitSignal );
-
-		if ( SignalIn & spoolerQuitSignal )
-			{
-			break;
-			}
-
-		if (SignalIn & spoolerStopSignal)
-			/*
-			 * Badly-synced stop signal arrived.  Tell upstairs
-			 * that we're done, goldurnit.   ewhac 9311.19
-			 */
-			SendSignal (myParent, spoolerHasStoppedSignal);
-
-		if (!(SignalIn & spoolerStartSignal))
-			/*
-			 * Badly-synced stop signal arrived, or other
-			 * signal we don't know how to deal with at this
-			 * time.  Cycle over.  ewhac 9311.03
-			 */
-			continue;
-
-
-		// Got a start spooling signal - so do it!
-
-		spoolerRunning = true;
-
-		if ( spoolerRoomIns >= 0 )
-			{
-			FreeInstrument( spoolerRoomIns );
-			spoolerRoomIns = -1;
-			}
-
-		result = LoadSoundFile( spoolerSFP, spoolerFileName );
-		CHECKRESULT(result,"LoadSoundFile");
-
-		/* Set up our envelope control over it */
-
-		result = ConnectInstruments ( spoolerEnvIns, "Output", spoolerSFP->sfp_SamplerIns, "Amplitude");
-		CHECKRESULT( result, "ConnectInstruments (SpoolerSFP)" );
-
-		spoolerEnvPoints[0].dtpr_Data = 0;
-		spoolerEnvPoints[0].dtpr_Time = 0;
-
-		spoolerEnvPoints[1].dtpr_Data = spoolerAmplitude;
-		spoolerEnvPoints[1].dtpr_Time = 200;
-
-		spoolerEnvPoints[2].dtpr_Data = 0;
-		spoolerEnvPoints[2].dtpr_Time = 400;
-
-		spoolerEnvelope = CreateEnvelope( spoolerEnvPoints, 3, 1, 1 );
-		CHECKRESULT( spoolerEnvelope, "CreateEnvelope" );
-
-		spoolerEnvAttachment = AttachEnvelope( spoolerEnvIns, spoolerEnvelope, "Env" );
-		CHECKRESULT( spoolerEnvAttachment, "CreateAttachment" );
-
-		result = StartInstrument( spoolerEnvIns, NULL );
-		CHECKRESULT( result, "StartInstrument" );
-
-		SignalIn = 0;
-		while ( spoolerNumReps > 0 )
-			{
-			spoolerNumReps--;
-
-			result = RewindSoundFile( spoolerSFP );
-			CHECKRESULT( result, "RewindSoundFile" );
-
-			result = StartSoundFile( spoolerSFP, spoolerAmplitude );
-			CHECKRESULT(result,"StartSoundFile");
-
-			/* Keep playing until no more samples. */
-			spoolServiceSignal = 0;
-			do	{
-				if ( spoolServiceSignal )
-					{
-					SignalIn = WaitSignal(spoolServiceSignal | spoolerStopSignal | spoolerQuitSignal );
-					}
-				else
-					{
-					SignalIn = 0;
-					}
-
-				if ( (SignalIn & spoolerStopSignal) || (SignalIn & spoolerQuitSignal))
-					{
-					spoolerNumReps = 0;
-					break;
-					}
-
-				// signal must be a service routine
-
-				result = ServiceSoundFile(spoolerSFP, SignalIn, &spoolServiceSignal);
-				CHECKRESULT(result,"ServiceSoundFile");
-
-				} while ( spoolServiceSignal );
-
-
-			result = StopSoundFile (spoolerSFP);
-			CHECKRESULT(result,"StopSoundFile");
-#if 0
-			if ( spoolerNumReps )
-				{
-				result = RewindSoundFile( spoolerSFP );
-				CHECKRESULT( result, "RewindSoundFile" );
-				}
-#endif
-			}
-
-		StopInstrument( spoolerEnvIns, nil );
-
-		DetachEnvelope( spoolerEnvAttachment );
-
-		DeleteEnvelope( spoolerEnvelope );
-
-		// Commented out for now because of a DisconnectInstruments() bug.
-		// Not having it in is fine, but it should probably be there for completeness.
-
-		//result = DisconnectInstruments( spoolerEnvIns, "Output", spoolerSFP->sfp_SamplerIns, "Amplitude");
-		//CHECKRESULT( result, "DisconnectInstruments (SpoolerSFP)" );
-
-		result = UnloadSoundFile( spoolerSFP );
-		CHECKRESULT( result,"UnloadSoundFile" );
-
-		if ( spoolerRoomIns < 0 )
-			{
-			spoolerRoomIns = LoadInstrument( spoolSaveFileName, 0, 100 );
-			CHECKRESULT( spoolerRoomIns, "LoadInstrument" );
-			}
-
-		spoolerRunning = false;
-
-		if ( SignalIn & spoolerStopSignal )
-			{
-			SendSignal(myParent, spoolerHasStoppedSignal);
-			}
-
-		if ( SignalIn & spoolerQuitSignal )
-			{
-			break;
-			}
-
-		}
-
-	/* Done - send signal when I'm finished so process can kill me. */
-
-	error:
-	if ( spoolerStartSignal ) FreeSignal( spoolerStartSignal );
-	spoolerStartSignal = 0;
-	if ( spoolerStopSignal ) FreeSignal( spoolerStopSignal );
-	spoolerStopSignal = 0;
-	if ( spoolerQuitSignal ) FreeSignal( spoolerQuitSignal );
-	spoolerQuitSignal = 0;
-
-	if ( spoolerSFP ) DeleteSoundFilePlayer( spoolerSFP );
-	spoolerSFP = 0;
-
-	if ( spoolerRoomIns >= 0 )
-		{
-		FreeInstrument( spoolerRoomIns );
-		spoolerRoomIns = -1;
-		}
-
-	CloseAudioFolio();
-
-	/* Tell parent task that I've cleaned up and can be killed. */
-
-	SendSignal(myParent, spoolerOuttaHereSignal);
-
-	/* Wait for parent to kill me (quick and painlessly, without memory loss, hopefully. */
-
-	WaitSignal(0);
+    if (v->stream)
+    {
+        SDL_UnbindAudioStream(v->stream);
+        SDL_DestroyAudioStream(v->stream);
+        v->stream = NULL;
+    }
+    freesample(&v->sample);
+    v->active = 0;
+    v->soundID = 0;
 }
 
-/****************************************/
-/* RAM Resident Sound Functions			*/
-/****************************************/
-
-/*
-**	LoadRAMSound()
-*/
-static int32
-LoadRAMSound( LoadRAMSoundPtr loadSndPtr )
+static int make_voice_from_sample(int id, const SDL3DOSample *srcSample, int amp, int balance, int freqOverride)
 {
- 	int32 	result = noErr;
-	int32 	i, soundSlot;
-	char	*instrName;
+    SDL_AudioSpec src;
+    SDL3DOSample s;
+    int i, sel = -1;
+    if (!gAudioReady || !srcSample || !srcSample->data)
+        return -1;
+    for (i = 0; i < MAX_SDL_VOICES; i++)
+        if (!gVoices[i].active)
+        {
+            sel = i;
+            break;
+        }
+    if (sel < 0)
+    {
+        stop_voice(&gVoices[0]);
+        sel = 0;
+    }
+    memset(&s, 0, sizeof(s));
+    s.freq = srcSample->freq;
+    s.channels = srcSample->channels;
+    s.len = srcSample->len;
+    s.data = (uint8 *)malloc((size_t)s.len);
+    if (!s.data)
+        return -1;
+    memcpy(s.data, srcSample->data, (size_t)s.len);
 
-	if ( loadSndPtr->soundID == nil || loadSndPtr->soundFileName == nil ||
-			loadSndPtr->amplitude == nil )
-		{
-		ERR(("SoundLibErr: WARNING! Got a nil parameter that probably shouldn't be nil for SpoolSound\n"));
-		}
+    {
+        int16 *pcm = (int16 *)s.data, n = s.len / 2, leftGain = amp, rightGain = amp;
+        if (s.channels >= 2)
+        {
+            leftGain = (amp * (100 - MIN(100, MAX(0, balance)))) / 50;
+            rightGain = (amp * MIN(100, MAX(0, balance))) / 50;
+        }
+        else
+            leftGain = rightGain = amp;
+        for (i = 0; i < n; i++)
+        {
+            int channel = s.channels > 1 ? (i % s.channels) : 0;
+            int32 v = pcm[i];
+            int32 gain = (channel == 0 ? leftGain : rightGain);
+            v = (v * gain) / MAXAMPLITUDE;
+            if (v > 32767)
+                v = 32767;
+            if (v < -32768)
+                v = -32768;
+            pcm[i] = (int16)v;
+        }
+    }
+    memset(&src, 0, sizeof(src));
+    src.format = SDL_AUDIO_S16LE;
+    src.channels = s.channels;
+    src.freq = freqOverride ? (int)((double)s.freq * (double)freqOverride / 32768.0 + 0.5) : s.freq;
+    gVoices[sel].stream = SDL_CreateAudioStream(&src, NULL);
+    if (!gVoices[sel].stream)
+    {
+        freesample(&s);
+        return -1;
+    }
+    if (!SDL_BindAudioStream(gAudioDevice, gVoices[sel].stream))
+    {
+        stop_voice(&gVoices[sel]);
+        freesample(&s);
+        return -1;
+    }
+    if (!SDL_PutAudioStreamData(gVoices[sel].stream, s.data, s.len))
+    {
+        fprintf(stderr, "SDL3 audio: queue failed for SFX %d: %s\n", id, SDL_GetError());
+        stop_voice(&gVoices[sel]);
+        freesample(&s);
+        return -1;
+    }
 
-	if ( loadSndPtr->soundID == 0 )
-		{
-		ERR(("SoundLibErr: You can't have a sound ID of 0!\n"));
-		return (-1);
-		}
-
-	soundSlot = -1;
-	for ( i = 0; i < kMaxRamSounds; i++ )
-		{
-		if ( sounds[i].soundID == 0 )
-			{
-			soundSlot = i;
-			break;
-			}
-		}
-
-	if ( soundSlot == -1 )
-		{
-		ERR(("SoundLibErr: You have already loaded the maximum number of sounds. Sorry.\n"));
-		return (-1);
-		}
-
-	sounds[soundSlot].soundID = loadSndPtr->soundID;
-	sounds[soundSlot].amplitude = loadSndPtr->amplitude;
-	sounds[soundSlot].balance = loadSndPtr->balance;
-	sounds[soundSlot].frequency = loadSndPtr->frequency;
-
-	sounds[soundSlot].sample = LoadSample( loadSndPtr->soundFileName );
-	CHECKRESULT( sounds[soundSlot].sample, "LoadSample" );
-
-	instrName = SelectSamplePlayer( sounds[soundSlot].sample, loadSndPtr->frequency );
-	if (instrName == NULL)
-	{
-		ERR(("SoundLibErr: No instrument to play that sample.\n"));
-		goto error;
-	}
-	PRT(("Use instrument: %s\n", instrName));
-	strcpy( sounds[soundSlot].instrName, instrName );
-
-	sounds[soundSlot].channel[0] = -1;	// The important one; if this is -1, we haven't assigned a channel
-	sounds[soundSlot].channel[1] = -1;
-
-	AssignChannels( &sounds[soundSlot], false );	// assign a channel if possible
-
-  error:
-	return ( result );
+    if (!SDL_FlushAudioStream(gVoices[sel].stream))
+    {
+        fprintf(stderr, "SDL3 audio: flush failed for SFX %d: %s\n", id, SDL_GetError());
+        stop_voice(&gVoices[sel]);
+        freesample(&s);
+        return -1;
+    }
+    gVoices[sel].sample = s;
+    gVoices[sel].soundID = id;
+    gVoices[sel].active = 1;
+    return 0;
 }
 
-/*
-**	AssignChannels()
-*/
-static int32
-AssignChannels( SoundDataPtr theSound, int32 mustSucceed )
+static int start_music(const char *file, int reps, int amp)
 {
-	int32 	result = noErr;
-	char	aName[50];
-	int32	aSlot, anotherSlot, i;
+    SDL_AudioSpec src;
+    stop_voice(&gMusic);
+    if (!gAudioReady)
+        return -1;
 
-	if ( theSound->channel[0] >= 0 )
-		{
-		return noErr;	// already assigned
-		}
+    if (load_aifc(file, &gMusic.sample) < 0)
+    {
+        fprintf(stderr, "SDL3 audio: music load failed: %s\n", file ? file : "(null)");
+        return -1;
+    }
 
-	// Check Our Resources
-
-	aSlot = FindEmptyChannel();
-	theSound->instrument = MyLoadInstrument( theSound->instrName );
-
-	if ( theSound->instrument == AF_ERR_NORSRC ||
-			( theSound->instrument >= 0 && aSlot == -1 ) )
-		{
-		if ( mustSucceed == false )
-			{
-			return noErr;
-			}
-		else
-			{
-			while ( numSoundsAssigned > 0 && (theSound->instrument == AF_ERR_NORSRC
-										|| ( theSound->instrument >= 0 && aSlot == -1 ) ) )
-				{
-				PRT(("Unassigning because I need the room.\n"));
-
-				for ( i = 0; i < kMaxRamSounds; i++ )
-					{
-					if ( sounds[i].soundID == assignQueue[0] )
-						{
-						UnassignChannels( &sounds[i] );
-						break;
-						}
-					}
-
-				if ( theSound->instrument < 0 )
-					{
-					theSound->instrument = MyLoadInstrument( theSound->instrName );
-					}
-				aSlot = FindEmptyChannel();
-				}
-			}
-		}
-	CHECKRESULT( theSound->instrument, "MyLoadInstrument" );
-	if ( aSlot == -1 )
-		{
-		ERR(("SoundLibErr: No Empty Channels in Mixer For Sound"));
-		if ( theSound->instrument >= 0 )
-			{
-			MyUnloadInstrument( theSound );
-			}
-		return (-1);
-		}
-
-	FlushInstrument( theSound->instrument );
-
-	theSound->attachment = AttachSample( theSound->instrument, theSound->sample, 0 );
-	CHECKRESULT( theSound->attachment, "AttachSample" );
-
-	theSound->freqKnob = -1;
-
-	// Assume we have a mono sound
-
-	sprintf( aName, "Input%d", aSlot );
-	result = ConnectInstruments( theSound->instrument, "Output", MixerIns, aName );
-	if ( result == noErr )
-		{
-		theSound->channel[0] = aSlot;
-		}
-
-	if ( result ) 	// Probably a stereo sound (i.e. can't find "Output")
-		{
-		// Stero Sound; assume instrument outputs are "LeftOutput" and "RightOutput"
-		PRT(("Looks like a stereo sound to me."));
-
-		sprintf( aName, "Input%d", aSlot );
-		result = ConnectInstruments( theSound->instrument, "LeftOutput", MixerIns, aName );
-		if ( result == noErr )
-			{
-			theSound->channel[0] = aSlot;
-			}
-		CHECKRESULT( result, "ConnectInstruments" );
-
-		// Allocate a second channel for the sound
-
-		anotherSlot = FindEmptyChannel();
-		if ( anotherSlot == -1 )
-			{
-			if ( mustSucceed )
-				{
-				ERR(("SoundLibErr: No Empty Channels in Mixer For Stereo Sound's Second Channel"));
-				return (-1);
-				}
-			else
-				{
-				result = DisconnectInstruments( theSound->instrument, "LeftOutput", MixerIns, aName );
-				DetachSample( theSound->attachment );
-				theSound->attachment = -1;
-				MyUnloadInstrument( theSound );
-				theSound->instrument = -1;
-				theSound->channel[0] = -1;
-				return noErr;
-				}
-
-			}
-
-		sprintf( aName, "Input%d", anotherSlot );
-		result = ConnectInstruments( theSound->instrument, "RightOutput", MixerIns, aName );
-		if ( result == noErr )
-			{
-			theSound->channel[1] = anotherSlot;
-			}
-		CHECKRESULT( result, "ConnectInstruments" );
-
-		}
-
-	// Make Sure all our mixer levels are correct
-
-	result = SetMixerLevels( soundLibraryMainLevel );
-	CHECKRESULT( result, "SetMixerLevels" );
-
-	if ( theSound->channel[0] != -1 && result == noErr )
-		{
-		assignQueue[numSoundsAssigned++] = theSound->soundID;	// add to end of queue
-		}
-
-	error:
-	return ( result );
+    memset(&src, 0, sizeof(src));
+    src.format = SDL_AUDIO_S16LE;
+    src.channels = gMusic.sample.channels;
+    src.freq = gMusic.sample.freq;
+    gMusic.stream = SDL_CreateAudioStream(&src, NULL);
+    if (!gMusic.stream)
+    {
+        fprintf(stderr, "SDL3 audio: music stream creation failed for %s: %s\n", file, SDL_GetError());
+        freesample(&gMusic.sample);
+        return -1;
+    }
+    if (!SDL_BindAudioStream(gAudioDevice, gMusic.stream))
+    {
+        fprintf(stderr, "SDL3 audio: music stream bind failed for %s: %s\n", file, SDL_GetError());
+        stop_voice(&gMusic);
+        return -1;
+    }
+    gMusic.active = 1;
+    gMusic.soundID = -1;
+    gMusicLoop = reps;
+    SDL_SetAudioStreamGain(gMusic.stream, (float)amp / (float)MAXAMPLITUDE);
+    if (!SDL_PutAudioStreamData(gMusic.stream, gMusic.sample.data, gMusic.sample.len))
+    {
+        fprintf(stderr, "SDL3 audio: initial music queue failed for %s: %s\n", file, SDL_GetError());
+        stop_voice(&gMusic);
+        gMusicLoop = 0;
+        return -1;
+    }
+    fprintf(stderr, "SDL3 audio: music started: %s (%d Hz, %d ch, %d bytes, reps=%d)\n", file, gMusic.sample.freq, gMusic.sample.channels, gMusic.sample.len, reps);
+    return 0;
 }
 
-/*
-**	FindEmptyChannel()
-*/
-static int32
-FindEmptyChannel()
+void SDL3_3DO_AudioPump(void)
 {
-	int32	foundChannel = -1;
-	int32	i, j;
-	int32	channelIsHit = nil;
+    int queued;
+    int i;
 
-	for ( i = 0; i < kMaxRamSounds; i++ )
-		{
-		if ( sounds[i].soundID )
-			{
-			for ( j = 0; j < 1; j++ )
-				{
-				if ( sounds[i].channel[j] >= 0 )
-					{
-					channelIsHit |= (1 << sounds[i].channel[j]);
-					}
-				}
-			}
-		}
+    for (i = 0; i < MAX_SDL_VOICES; i++)
+    {
+        if (gVoices[i].active && gVoices[i].stream)
+        {
+            if (SDL_GetAudioStreamQueued(gVoices[i].stream) == 0 &&
+                SDL_GetAudioStreamAvailable(gVoices[i].stream) == 0)
+                stop_voice(&gVoices[i]);
+        }
+    }
 
-	for ( i = 0; i < kNumChannels; i++  )
-		{
-		if ( (channelIsHit & (1 << i)) == nil )
-			{
-			foundChannel = i;
-			break;
-			}
-		}
-
-	return foundChannel;
+    if (!gMusic.active || !gMusic.stream || !gMusicLoop)
+        return;
+    queued = SDL_GetAudioStreamQueued(gMusic.stream);
+    if (gMusicLoop == 1 && queued == 0 && SDL_GetAudioStreamAvailable(gMusic.stream) == 0)
+    {
+        stop_voice(&gMusic);
+        gMusicLoop = 0;
+        return;
+    }
+    if (queued < gMusic.sample.len / 2)
+    {
+        if (gMusicLoop > 1 || gMusicLoop < 0)
+        {
+            if (gMusicLoop > 1)
+                gMusicLoop--;
+            if (!SDL_PutAudioStreamData(gMusic.stream, gMusic.sample.data, gMusic.sample.len))
+                fprintf(stderr, "SDL3 audio: music loop queue failed: %s\n", SDL_GetError());
+        }
+    }
 }
 
-
-/*
-**	MyLoadInstrument()
-*/
-static Item
-MyLoadInstrument( char *instrName )
+int32 CallSound(soundPtr)
+union CallSoundRec *soundPtr;
 {
-	int32	 result = noErr;
-	int32 	i;
-
-	for ( i = 0; i < numCachedInstrs; i++ )
-		{
-		if ( strcmp( instrName, cachedInstrName[i] ) == 0 )
-			{
-			return AllocInstrument( cachedInstrItem[i], 100 );
-			}
-		}
-
-	if (numCachedInstrs < MAX_CACHED_INSTRUMENTS)
-		{
-		strcpy( cachedInstrName[numCachedInstrs], instrName );
-		cachedInstrItem[numCachedInstrs] = LoadInsTemplate( instrName, 0 );
-		CHECKRESULT( cachedInstrItem[numCachedInstrs], "LoadInsTemplate" );
-
-		return AllocInstrument( cachedInstrItem[numCachedInstrs++], 100 );
-		}
-	else
-		{
-		return LoadInstrument( instrName, 0, 100 );
-		}
-
-	error:
-	return (-1);
-}
-
-/*
-**	MyUnloadInstrument()
-*/
-static int32
-MyUnloadInstrument( SoundDataPtr theSound )
-{
-	int32 	i;
-
-	for ( i = 0; i < numCachedInstrs; i++ )
-		{
-		if ( strcmp( theSound->instrName, cachedInstrName[i] ) == 0 )
-			{
-			return FreeInstrument( theSound->instrument );
-			}
-		}
-
-	return UnloadInstrument( theSound->instrument );
-}
-
-/*
-**	UnloadRAMSound()
-*/
-static int32
-UnloadRAMSound( int32 soundID )
-{
-	int32	 result = noErr;
-	int32 	i, foundSlot = -1;
-
-	if ( soundID == 0 )
-		{
-		ERR(("SoundLibErr: You can't have a sound ID of 0!\n"));
-		return (-1);
-		}
-
-	for ( i = 0; i < kMaxRamSounds; i++ )
-		{
-		if ( sounds[i].soundID == soundID )
-			{
-			foundSlot = i;
-
-			UnassignChannels( &sounds[i] );
-
-			UnloadSample( sounds[i].sample );
-			sounds[i].sample = -1;
-
-			sounds[i].soundID = 0;
-			}
-		}
-
-	if ( foundSlot == -1 )
-		{
-		ERR(("SoundLibErr: No sound with that ID, so I can't unload it!\n"));
-		return (-1);
-		}
-
-	return result;
-}
-
-/*
-**	UnassignChannels()
-*/
-static int32
-UnassignChannels( SoundDataPtr theSound )
-{
-	char	aName[50];
-	int32	result = noErr;
-	int32	i;
-	int32	channel0, channel1;
-
-	if ( theSound->channel[0] == -1 )
-		{
-		return noErr;
-		}
-
-	for ( i = 0; i < numSoundsAssigned; i++ )
-		{
-		if ( assignQueue[i] == theSound->soundID )
-			{
-			numSoundsAssigned--;
-			memcpy( (void *) &assignQueue[i], (void *) &assignQueue[i+1],
-								(numSoundsAssigned - i) * sizeof(int32) );
-			break;
-			}
-		}
-
-	channel0 = theSound->channel[0];
-	channel1 = theSound->channel[1];
-
-	theSound->channel[0] = -1;
-	theSound->channel[1] = -1;
-
-	// Set Mixer Levels To Zero before we kill things
-
-	result = SetMixerLevels( soundLibraryMainLevel );
-	CHECKRESULT( result, "SetMixerLevels" );
-
-	if ( channel1  == -1 )		// mono
-		{
-		sprintf( aName, "Input%d", channel0 );
-		result = DisconnectInstruments( theSound->instrument, "Output", MixerIns, aName );
-		CHECKRESULT( result, "DisconnectInstruments" );
-		}
-	else									// stereo
-		{
-		sprintf( aName, "Input%d", channel0 );
-		result = DisconnectInstruments( theSound->instrument, "LeftOutput", MixerIns, aName );
-		CHECKRESULT( result, "DisconnectInstruments" );
-
-		sprintf( aName, "Input%d", channel1 );
-		result = DisconnectInstruments( theSound->instrument, "RightOutput", MixerIns, aName );
-		CHECKRESULT( result, "DisconnectInstruments" );
-		}
-
-	StopInstrument( theSound->instrument, nil );
-
-	if ( theSound->freqKnob != -1 )
-		{
-		ReleaseKnob( theSound->freqKnob );
-		theSound->freqKnob = -1;
-		}
-
-	DetachSample( theSound->attachment );
-	theSound->attachment = -1;
-	MyUnloadInstrument( theSound );
-	theSound->instrument = -1;
-
-	error:
-
-	return result;
-}
-
-
-TagArg FixedRAMSoundTags[] =
-	{
-		{ AF_TAG_AMPLITUDE, 0},
-	{ 0, 0 }
-	};
-
-TagArg VariableRAMSoundTags[] =
-	{
-		{ AF_TAG_AMPLITUDE, 0},
-		{ AF_TAG_RATE, 0},
-	{ 0, 0 }
-	};
-
-/*
-**	StartRAMSound()
-*/
-static int32
-StartRAMSound( int32 soundID )
-{
- 	int32 	result = noErr;
-	int32 	i, soundSlot;
-
-	soundSlot = -1;
-	for ( i = 0; i < kMaxRamSounds; i++ )
-		{
-		if ( sounds[i].soundID == soundID )
-			{
-			soundSlot = i;
-			break;
-			}
-		}
-
-	if ( soundSlot == -1 )
-		{
-		ERR(("SoundLibErr: Sound ID Invalid. Can't start it.\n"));
-		return (-1);
-		}
-
-	if ( AssignChannels( &sounds[soundSlot], true ) )
-		{
-		return (-1);
-		}
-
-	if ( sounds[soundSlot].frequency )
-		{
-		VariableRAMSoundTags[0].ta_Arg = (int32 *) MAXAMPLITUDE;
-		VariableRAMSoundTags[1].ta_Arg = (int32 *) sounds[soundSlot].frequency;
-		StartInstrument( sounds[soundSlot].instrument, &VariableRAMSoundTags[0] );
-
-		sounds[soundSlot].freqKnob = GrabKnob( sounds[soundSlot].instrument, "Frequency" );
-		CHECKRESULT( sounds[soundSlot].freqKnob, "GrabKnob" );
-		}
-	else
-		{
-		FixedRAMSoundTags[0].ta_Arg = (int32 *) MAXAMPLITUDE;
-		StartInstrument( sounds[soundSlot].instrument, &FixedRAMSoundTags[0] );
-		}
-
-	error:
-	return result;
-}
-
-/*
-**	StopRAMSound()
-*/
-static int32
-StopRAMSound( int32 soundID )
-{
- 	int32 	result = noErr;
-	int32 	i, soundSlot;
-
-	soundSlot = -1;
-	for ( i = 0; i < kMaxRamSounds; i++ )
-		{
-		if ( sounds[i].soundID == soundID )
-			{
-			soundSlot = i;
-			break;
-			}
-		}
-
-	if ( soundSlot == -1 )
-		{
-		ERR(("SoundLibErr: Sound ID Invalid. Can't start it.\n"));
-		return (-1);
-		}
-
-	StopInstrument( sounds[soundSlot].instrument, NULL);
-
-	return result;
-}
-
-/*
-**	SetRAMSoundFreq()
-*/
-static int32
-SetRAMSoundFreq( SetRAMSoundPtr setSndPtr )
-{
- 	int32 	result = noErr;
-	int32 	i, soundSlot;
-
-	soundSlot = -1;
-	for ( i = 0; i < kMaxRamSounds; i++ )
-		{
-		if ( sounds[i].soundID == setSndPtr->soundID )
-			{
-			soundSlot = i;
-			break;
-			}
-		}
-
-	if ( soundSlot == -1 )
-		{
-		ERR(("SoundLibErr: Sound ID Invalid. Can't start it.\n"));
-		return (-1);
-		}
-
-	if ( sounds[soundSlot].frequency == nil )
-		{
-		ERR(("SoundLibErr: This sound isn't a variable rate sound. Can't set frequency.\n"));
-		return (-1);
-		}
-
-	if ( sounds[soundSlot].frequency > 65535 )
-		{
-		ERR(("SoundLibErr: Trying to set rate too high. Setting to 65535.\n"));
-		sounds[soundSlot].frequency = 65535;
-		}
-
-	if ( sounds[soundSlot].frequency < 100 )
-		{
-		ERR(("SoundLibErr: Trying to set rate too low. Setting to 100.\n"));
-		sounds[soundSlot].frequency = 100;
-		}
-
-	sounds[soundSlot].frequency = setSndPtr->level;
-
-	if ( sounds[soundSlot].freqKnob!= -1 )
-		{
-		TweakRawKnob( sounds[soundSlot].freqKnob, sounds[soundSlot].frequency );
-		}
-
-	return result;
-}
-
-/*
-**	SetRAMSoundAmpl()
-*/
-static int32
-SetRAMSoundAmpl( SetRAMSoundPtr setSndPtr )
-{
- 	int32 	result = noErr;
-	int32 	i, soundSlot;
-
-	soundSlot = -1;
-	for ( i = 0; i < kMaxRamSounds; i++ )
-		{
-		if ( sounds[i].soundID == setSndPtr->soundID )
-			{
-			soundSlot = i;
-			break;
-			}
-		}
-
-	if ( soundSlot == -1 )
-		{
-		ERR(("SoundLibErr: Sound ID Invalid. Can't start it.\n"));
-		return (-1);
-		}
-
-	if ( sounds[soundSlot].frequency == nil )
-		{
-		ERR(("SoundLibErr: This sound isn't a variable rate sound. Can't set frequency.\n"));
-		return (-1);
-		}
-
-	sounds[soundSlot].amplitude = setSndPtr->level;
-
-	result = SetMixerLevels( soundLibraryMainLevel );
-
-	return result;
-}
-
-/*
-**	FlushInstrument()
-*/
-static int32
-FlushInstrument( Item SamplerIns )
-{
-	Item SampleItem, Attachment;
-	int32 result;
-
-	result=0;
-
-/* make short sample */
-	SampleItem = MakeSample( 32, NULL );
-	CHECKRESULT(SampleItem, "MakeSample" );
-	Attachment = AttachSample(SamplerIns, SampleItem, 0);
-	CHECKRESULT(Attachment, "AttachSample" );
-
-/* play it and let it go to silence */
-	result = StartInstrument( SamplerIns, NULL );
-	CHECKRESULT(result, "StartInstrument" );
-	SleepAudioTicks( 6 );  /* give it time to get into silence */
-	StopInstrument( SamplerIns, NULL);
-
-  error:
-	UnloadSample( SampleItem );
-	DetachSample( Attachment );
-	return result;
+    int i, id;
+    if (!soundPtr)
+        return -1;
+    switch (soundPtr->whatIWant)
+    {
+    case kInitializeSound:
+    {
+        SDL_AudioSpec want;
+        memset(&want, 0, sizeof(want));
+        want.format = SDL_AUDIO_S16LE;
+        want.channels = 2;
+        want.freq = 44100;
+        gAudioDevice = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want);
+        if (!gAudioDevice)
+        {
+            fprintf(stderr, "SDL3 audio init failed: %s\n", SDL_GetError());
+            gAudioReady = 0;
+            return -1;
+        }
+        gAudioReady = 1;
+
+        SDL_ResumeAudioDevice(gAudioDevice);
+        fprintf(stderr, "SDL3 audio: playback device opened (id=%u, requested 44100 Hz stereo S16LE)\n", (unsigned)gAudioDevice);
+        break;
+    }
+    case kCleanupSound:
+        SDL3_3DO_StopMovieAudio();
+        stop_voice(&gMusic);
+        for (i = 0; i < MAX_SDL_VOICES; i++)
+            stop_voice(&gVoices[i]);
+        for (i = 0; i < MAX_SDL_SOUNDS; i++)
+            freesample(&gSounds[i]);
+        if (gAudioDevice)
+            SDL_CloseAudioDevice(gAudioDevice);
+        gAudioDevice = 0;
+        gAudioReady = 0;
+        break;
+    case kLoadRAMSound:
+        id = soundPtr->loadSound.soundID;
+        if (id < 0 || id >= MAX_SDL_SOUNDS)
+            return -1;
+        freesample(&gSounds[id]);
+        return load_aifc(soundPtr->loadSound.soundFileName, &gSounds[id]);
+    case kUnloadRAMSound:
+        id = soundPtr->ramSound.soundID;
+        if (id >= 0 && id < MAX_SDL_SOUNDS)
+            freesample(&gSounds[id]);
+        for (i = 0; i < MAX_SDL_VOICES; i++)
+            if (gVoices[i].active && gVoices[i].soundID == id)
+                stop_voice(&gVoices[i]);
+        break;
+    case kStartRAMSound:
+        id = soundPtr->ramSound.soundID;
+        if (id < 0 || id >= MAX_SDL_SOUNDS || !gSounds[id].data)
+            return -1;
+        return make_voice_from_sample(id, &gSounds[id], MAXAMPLITUDE, 50, 0);
+    case kStopRAMSound:
+        id = soundPtr->ramSound.soundID;
+        for (i = 0; i < MAX_SDL_VOICES; i++)
+            if (gVoices[i].active && gVoices[i].soundID == id)
+                stop_voice(&gVoices[i]);
+        break;
+    case kSpoolSound:
+        return start_music(soundPtr->spoolSound.fileToSpool, soundPtr->spoolSound.numReps, soundPtr->spoolSound.amplitude);
+    case kStopSpoolingSound:
+    case kStopFadeSpoolSound:
+        stop_voice(&gMusic);
+        gMusicLoop = 0;
+        break;
+    case kIsSoundSpooling:
+        return gMusic.active;
+    case kBeQuiet:
+        if (gAudioDevice)
+            SDL_SetAudioDeviceGain(gAudioDevice, 0.0f);
+        break;
+    case kBeNoisy:
+        if (gAudioDevice)
+            SDL_SetAudioDeviceGain(gAudioDevice, 1.0f);
+        break;
+    case kSetRAMSoundAmpl:
+        break;
+    case kSetRAMSoundFreq:
+        break;
+    default:
+        break;
+    }
+    return 0;
 }

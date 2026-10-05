@@ -1,3 +1,15 @@
+/* Forward declarations kept explicit for modern C compilers. */
+#include <stdint.h>
+struct ImageEntry;
+struct ImageEnv;
+struct AnimLoaf;
+struct AnimDef;
+struct CelArray;
+struct ObDef;
+struct DSDataBuf;
+struct SaveGameRec;
+union CallSoundRec;
+
 /* ctst.c */
 int main(int ac, char **av);
 int gamemain(void);
@@ -6,6 +18,7 @@ void moveplayer(struct Vertex *ppos, frac16 *vang);
 void fullstop(void);
 void recoil(void);
 int moveposition(struct Vertex *ppos, struct Vector *trans, struct Object *ignoreob, int checkobs, int isplayer);
+int moveobjectslide(struct Vertex *ppos, struct Vector *trans, struct Object *ignoreob);
 int checkcontact(struct PathBox *pb, struct BBox *bb, int block);
 void blockpath(struct PathBox *pb, struct BBox *obst);
 void genpathbox(struct BBox *pathbox, struct BBox *fred, struct BBox *barney);
@@ -37,6 +50,12 @@ void closegamestuff(void);
 void openstuff(void);
 void closestuff(void);
 void die(char *str);
+/* portable replacements for the original ARM helper routines */
+void resetlinebuf(uint32 *buf);
+int islinefull(uint32 *buf);
+int testmarklinebuf(uint32 *buf, int32 lx, int32 rx);
+void mkVertPtrs(struct Vertex *verts, struct Vertex **ptrArray, int32 idx0, int32 idx1, int32 idx2, int32 idx3);
+void project(struct Vertex *src, struct Vertex *dest, int32 magic, int32 zpull, int32 cx, int32 cy, int32 npoints);
 /* rend.c */
 void rendercels(void);
 void buildcellist(struct VisOb *vo, int nvo, struct Vertex *verts, struct Vertex *xfverts, int indirect);
@@ -79,7 +98,7 @@ void takedamage(int32 hitpoints);
 frac16 approx2dist(frac16 x1, frac16 y1, frac16 x2, frac16 y2);
 frac16 approx3dist(frac16 x1, frac16 y1, frac16 z1, frac16 x2, frac16 y2, frac16 z2);
 int32 nextanimframe(struct AnimDef *ad, int32 fnum, int32 nvbls);
-int setupanimarray(struct CelArray **captr, int *animseq, struct CCB **ccbp);
+void setupanimarray(struct CelArray **captr, int *animseq, struct CCB **ccbp);
 void toggledoor(struct Object *ob);
 /* ob_zombie.c */
 void loadzombie(void);
@@ -148,9 +167,9 @@ int32 cvt2power(int32 val);
 struct ImageEnv *loadloaf(char *filename);
 void freeloaf(struct ImageEnv *iev);
 /* file.c */
-void *allocloadfile(char *filename, int32 memtype, int32 *err_len);
-void filerr(char *filename, int32 err);
-void filedie(char *filename, int32 err);
+void *allocloadfile(char *filename, int32 memtype, intptr_t *err_len);
+void filerr(char *filename, intptr_t err);
+void filedie(char *filename, intptr_t err);
 /* timing.c */
 void drawnumxy(Item bmi, int32 num, int32 x, int32 y);
 void opentimer(void);
@@ -182,6 +201,7 @@ void uncpaktorp(struct RastPort *rp);
 void startstream(void);
 void stopstream(void);
 int playcpak(char *filename);
+void SDL3_3DO_SetMouseGameMode(int enabled);
 /* map.c */
 int drawmap(void);
 void loadmap(void);

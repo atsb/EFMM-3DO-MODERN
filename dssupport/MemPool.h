@@ -3,7 +3,7 @@
  *
  *	Contains:		definitions for MemPool.c
  *
- *	Copyright Â© 1993 The 3DO Company. All Rights Reserved.
+ *	Copyright © 1993 The 3DO Company. All Rights Reserved.
  *
  *	History:
  *	5/9/93		jb		Added ForEachFreePoolMember() convenience routine

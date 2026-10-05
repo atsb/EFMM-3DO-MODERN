@@ -106,7 +106,6 @@ drawmap ()
 	Matrix			unit, cam;
 	int32			px, pz;
 	int			mf;
-	RastPort		*tmp;
 	Point			quad[4];
 
 	SetRast (rprend, COLR_BG);
@@ -338,10 +337,10 @@ static ubyte	ewdoor[] = {
 #define NOFFS_DOOR	(sizeof (nsdoor) / 2)
 
 
-static ubyte	exit[] = {
+static ubyte	exitGlyph[] = {
 	0, 0,	1, 1,	2, 2,	2, 0,	0, 2
 };
-#define	NOFFS_EXIT	(sizeof (exit) / 2)
+#define	NOFFS_EXIT	(sizeof (exitGlyph) / 2)
 
 
 static void
@@ -389,7 +388,7 @@ int32		x, z;
 		break;
 
 	case GLYPH_EXIT:
-		drawpoints (rp, x, z, exit, NOFFS_EXIT, COLR_EXIT);
+		drawpoints (rp, x, z, exitGlyph, NOFFS_EXIT, COLR_EXIT);
 		break;
 
 	case GLYPH_NSDOOR:

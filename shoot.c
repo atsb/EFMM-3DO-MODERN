@@ -573,7 +573,7 @@ loadgun ()
 				  CCB_LDPPMP | CCB_YOXY | CCB_ACW |
 				  ccbextra;
 		ccb->ccb_Flags &= ~(CCB_ACCW | CCB_TWD);
-
+		ccb->ccb_Flags &= ~CCB_BGND;
 		ccb->ccb_Flags |= CCB_LAST;	// Always the last thing.
 	}
 }

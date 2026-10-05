@@ -33,7 +33,7 @@ typedef struct ObTrigger {
 /***************************************************************************
  * $(EXPLETIVE) forward reference to placate $(EXPLETIVE) compiler.
  */
-static int32 triggerfunc (struct ObTrigger *, int, void *);
+static intptr_t triggerfunc (struct ObTrigger *, int, void *);
 
 
 /***************************************************************************
@@ -60,7 +60,7 @@ extern MapEntry	levelmap[WORLDSIZ][WORLDSIZ];
 /***************************************************************************
  * Code.
  */
-static int32
+static intptr_t
 triggerfunc (ob, op, dat)
 register struct ObTrigger	*ob;
 int				op;
@@ -74,7 +74,7 @@ void				*dat;
 		return (def_Trigger.od.od_ObCount);
 
 	case OP_CREATEOB:
-		return ((int32) createStdObject ((ObDef *) &def_Trigger,
+		return ((intptr_t) createStdObject ((ObDef *) &def_Trigger,
 						 OTYP_TRIGGER,
 						 sizeof (ObTrigger),
 						 0,

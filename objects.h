@@ -7,6 +7,8 @@
 #ifndef	_OBJECTS_H
 #define	_OBJECTS_H
 
+#include <stdint.h>
+
 #ifndef	_CASTLE_H
 #include "castle.h"
 #endif
@@ -16,7 +18,7 @@
  * General case Object and Object definition structures.
  */
 typedef struct ObDef {
-	int32	(*od_Func)();		/*  Function handler		*/
+	intptr_t	(*od_Func)();		/* Function handler; may return a pointer. */
 	ubyte	od_Type;
 	ubyte	od_State;
 	ubyte	od_Flags;

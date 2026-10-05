@@ -29,7 +29,7 @@
 /***************************************************************************
  * $(EXPLETIVE) forward reference to placate $(EXPLETIVE) compiler.
  */
-static int32 powerfunc (struct ObPowerup *, int, void *);
+static intptr_t powerfunc (struct ObPowerup *, int, void *);
 static int32 takekey (struct ObPowerup *);
 static int32 takeammo (struct ObPowerup *);
 static int32 takemoneyandrun (struct ObPowerup *);
@@ -105,7 +105,7 @@ extern int32	nkeys;
 /***************************************************************************
  * Code.
  */
-static int32
+static intptr_t
 powerfunc (ob, op, dat)
 register struct ObPowerup	*ob;
 int				op;
@@ -140,7 +140,7 @@ void				*dat;
 		break;
 
 	case OP_CREATEOB:
-		return ((int32) createStdObject ((ObDef *) &def_Powerup,
+		return ((intptr_t) createStdObject ((ObDef *) &def_Powerup,
 						 OTYP_POWERUP,
 						 sizeof (ObPowerup),
 						 def_Powerup.od.od_ObCount ?
@@ -171,7 +171,7 @@ void				*dat;
 	case OP_MOVE:
 		cycleanimloafs (def_Powerup.od_AL,
 				def_Powerup.od_Env->iev_NAnimEntries,
-				(int32) dat);
+				(int32) (intptr_t) dat);
 		break;
 
 	case OP_REGISTER:

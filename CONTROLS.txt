@@ -1,0 +1,41 @@
+EFMM Controls
+
+Keyboard
+
+Up / Down arrows: Move up and down, including vertical menu choices.
+Left / Right arrows: Turn left and right, and move through horizontal menu choices.
+W / S: Alternative up and down movement keys.
+A / Q: Strafe left.
+D / E: Strafe right.
+C: C button.
+F: X button.
+Escape: Sends X once.
+Left or Right Ctrl: A button.
+Space: B button.
+Enter: Start button.
+Alt+Enter: Toggle fullscreen.
+The A key is used for strafe-left. Ctrl is used for the A button.
+
+Mouse
+
+Mouse movement left and right: Turn left and right.
+Left mouse button: A button.
+Right mouse button: B button.
+Mouse movement up and down is not mapped.
+Mouse controls are enabled during gameplay.
+
+Gamepad
+
+D-pad Up / Down: Move up and down.
+D-pad Left / Right: Turn left and right.
+Left stick Up / Down: Move up and down.
+Left stick Left / Right: Strafe left and right.
+Right stick Left / Right: Turn left and right.
+Left shoulder / L1 / LB: Left Shift.
+Right shoulder / R1 / RB: Right Shift.
+South face button / Cross / A: A button.
+East face button / Circle / B: B button.
+West face button / Square / X: C button.
+North face button / Triangle / Y: X button.
+Back / Create / Share: X button.
+Start / Options / Menu: Start button.

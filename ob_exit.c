@@ -33,7 +33,7 @@ typedef struct ObExit {
 /***************************************************************************
  * $(EXPLETIVE) forward reference to placate $(EXPLETIVE) compiler.
  */
-static int32 exitfunc (struct ObExit *, int, void *);
+static intptr_t exitfunc (struct ObExit *, int, void *);
 
 
 /***************************************************************************
@@ -61,7 +61,7 @@ extern int8	gottalisman;
 /***************************************************************************
  * Code.
  */
-static int32
+static intptr_t
 exitfunc (ob, op, dat)
 register struct ObExit	*ob;
 int			op;
@@ -75,7 +75,7 @@ void			*dat;
 		return (def_Exit.od.od_ObCount);
 
 	case OP_CREATEOB:
-		return ((int32) createStdObject ((ObDef *) &def_Exit,
+		return ((intptr_t) createStdObject ((ObDef *) &def_Exit,
 						 OTYP_EXIT,
 						 sizeof (ObExit),
 						 0,
